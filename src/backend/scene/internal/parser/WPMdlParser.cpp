@@ -1003,6 +1003,106 @@ Result<void> ParseWorldBindSection(fs::IBinaryStream& f,
     }
     return SeekToWPMdlSectionEnd(f, section);
 }
+
+bool ConvertGenericMeshesToStaticChunks(WPMdl& mdl) {
+    mdl.static_chunks.clear();
+    mdl.static_chunks.reserve(mdl.meshes.size());
+
+    for (const auto& mesh : mdl.meshes) {
+        if (mesh.material_json_file.empty()) {
+            LOG_ERROR("modern static mdl mesh has empty material path");
+            return false;
+        }
+        if (mesh.positions.empty() || mesh.indices.empty()) {
+            LOG_ERROR("modern static mdl mesh '%s' has no geometry",
+                      mesh.material_json_file.c_str());
+            return false;
+        }
+        if (mesh.positions.size() > std::numeric_limits<std::uint16_t>::max()) {
+            LOG_ERROR("modern static mdl mesh '%s' exceeds uint16 static index range (%zu verts)",
+                      mesh.material_json_file.c_str(),
+                      mesh.positions.size());
+            return false;
+        }
+
+        WPMdl::StaticChunk chunk;
+        chunk.material_json_file = mesh.material_json_file;
+        if (mesh.has_aabb) {
+            chunk.bounds_min = mesh.aabb_min;
+            chunk.bounds_max = mesh.aabb_max;
+        }
+
+        chunk.vertexs.resize(mesh.positions.size());
+        for (usize index = 0; index < mesh.positions.size(); ++index) {
+            auto& vertex = chunk.vertexs[index];
+            vertex.position = mesh.positions[index];
+            if (index < mesh.normals.size()) vertex.normal = mesh.normals[index];
+            if (index < mesh.tangents.size()) vertex.tangent4 = mesh.tangents[index];
+            if (index < mesh.texcoords.size()) vertex.texcoord = mesh.texcoords[index];
+            if (index < mesh.texcoord2.size()) vertex.texcoord2 = mesh.texcoord2[index];
+        }
+
+        chunk.indices.reserve(mesh.indices.size());
+        for (const auto& triangle : mesh.indices) {
+            std::array<uint16_t, 3> out {};
+            for (usize corner = 0; corner < 3; ++corner) {
+                if (triangle[corner] > std::numeric_limits<std::uint16_t>::max()) {
+                    LOG_ERROR("modern static mdl mesh '%s' has out-of-range index %u",
+                              mesh.material_json_file.c_str(),
+                              triangle[corner]);
+                    return false;
+                }
+                out[corner] = static_cast<uint16_t>(triangle[corner]);
+            }
+            chunk.indices.push_back(out);
+        }
+
+        if (! mesh.has_aabb) UpdateStaticBounds(chunk);
+        mdl.static_chunks.push_back(std::move(chunk));
+    }
+
+    mdl.kind = WPMdl::MeshKind::Static;
+    return ! mdl.static_chunks.empty();
+}
+
+bool ParseModernStaticModel(fs::IBinaryStream& f, std::string_view path, WPMdl& mdl) {
+    auto headerResult = ParseWPMdlHeader(f);
+    if (! headerResult) {
+        LOG_ERROR("modern static mdl header parse failed for '%.*s': %s",
+                  static_cast<int>(path.size()),
+                  path.data(),
+                  headerResult.error().message.c_str());
+        return false;
+    }
+
+    mdl = WPMdl {};
+    mdl.header = headerResult.value();
+    mdl.mdlv = mdl.header.mdlv;
+
+    auto geometryResult = ParseGenericMdlGeometry(f, mdl);
+    if (! geometryResult) {
+        LOG_ERROR("modern static mdl geometry parse failed for '%.*s': %s",
+                  static_cast<int>(path.size()),
+                  path.data(),
+                  geometryResult.error().message.c_str());
+        return false;
+    }
+
+    if (! ConvertGenericMeshesToStaticChunks(mdl)) {
+        LOG_ERROR("modern static mdl chunk conversion failed for '%.*s'",
+                  static_cast<int>(path.size()),
+                  path.data());
+        return false;
+    }
+
+    LOG_INFO("modern static mdl: path='%.*s' version=%d meshes=%zu chunks=%zu",
+             static_cast<int>(path.size()),
+             path.data(),
+             mdl.mdlv,
+             mdl.meshes.size(),
+             mdl.static_chunks.size());
+    return true;
+}
 } // namespace
 
 bool WPMdlParser::ParseStaticModel(std::string_view path, fs::VFS& vfs, WPMdl& mdl) {
@@ -1015,6 +1115,24 @@ bool WPMdlParser::ParseStaticModel(std::string_view path, fs::VFS& vfs, WPMdl& m
 
     auto memfile = fs::MemBinaryStream(*pfile);
     auto& f      = memfile;
+
+    // MDLV0023+ model objects use the generic per-mesh layout (bitflag vertex attributes, AABB,
+    // parts/masks). The legacy static chunk reader only understands versions listed in
+    // kStaticMdlFormats (4 and 14). Peek the shared header and route accordingly.
+    const idx start = f.Tell();
+    auto headerPeek = ParseWPMdlHeader(f);
+    if (headerPeek && FindStaticMdlFormat(headerPeek.value().mdlv) == nullptr) {
+        if (! f.SeekSet(start)) {
+            LOG_ERROR("static mdl rewind failed before modern parse: %s", str_path.c_str());
+            return false;
+        }
+        return ParseModernStaticModel(f, str_path, mdl);
+    }
+
+    if (! f.SeekSet(start)) {
+        LOG_ERROR("static mdl rewind failed before legacy parse: %s", str_path.c_str());
+        return false;
+    }
 
     mdl = WPMdl {};
     mdl.mdlv = ReadMDLVesion(f);
