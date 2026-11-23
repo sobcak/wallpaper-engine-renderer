@@ -30,9 +30,9 @@ static constexpr std::string_view SHADER_PLACEHOLD { "__SHADER_PLACEHOLD__" };
 #define SHADER_SRC_DIR "prepared-shaders02"
 #define SHADER_SRC_SUFFIX "wpsrc"
 
-static constexpr int              kPreparedShaderSourceVersion { 5 };
+static constexpr int              kPreparedShaderSourceVersion { 6 };
 static constexpr std::string_view kPreparedShaderPipelineKey {
-    "prepared-shader-v20-directive-terminator-sanitize\n"
+    "prepared-shader-v21-require-lighting-v1-stub\n"
 };
 
 using namespace wallpaper;
@@ -1384,8 +1384,27 @@ inline std::string PreprocessDxcWeSource(const std::string& src, ShaderType stag
 }
 
 inline std::string CommentOutRequireDirectives(const std::string& src) {
+    // Wallpaper Engine's stock shaders use `#require LightingV1` so the Windows HLSL toolchain can
+    // inject a light-loop body sized to the scene's light slots. Without that injector, generic4 /
+    // foliage4 / particle shaders call undeclared PerformLighting_V1 and fail DXC. Expand the
+    // known require into a view-lit stub (ambient still comes from CombineLighting) and keep any
+    // other requires commented so unknown directives stay inert.
+    constexpr std::string_view kLightingV1Stub =
+        "// expanded #require LightingV1 (stub — no per-light injection yet)\n"
+        "vec3 PerformLighting_V1(vec3 worldPos, vec3 albedo, vec3 normal, vec3 viewVector,\n"
+        "                        vec3 specularTint, vec3 f0, float roughness, float metallic) {\n"
+        "    return albedo * max(dot(normalize(normal), normalize(viewVector)), 0.0);\n"
+        "}\n"
+        "vec3 PerformLighting_V1(vec3 worldPos, vec3 albedo, vec3 normal, vec3 viewVector,\n"
+        "                        vec3 specularTint, vec3 f0, float roughness, float metallic,\n"
+        "                        float ao) {\n"
+        "    return PerformLighting_V1(worldPos, albedo, normal, viewVector, specularTint, f0,\n"
+        "                              roughness, metallic) * ao;\n"
+        "}\n";
+
     std::string out;
-    out.reserve(src.size());
+    out.reserve(src.size() + kLightingV1Stub.size());
+    bool injected_lighting_v1 { false };
 
     size_t pos { 0 };
     while (pos < src.size()) {
@@ -1398,9 +1417,27 @@ inline std::string CommentOutRequireDirectives(const std::string& src) {
         const auto first_non_ws = line.find_first_not_of(" \t\r");
         if (first_non_ws != std::string_view::npos &&
             line.substr(first_non_ws).compare(0, 8, "#require") == 0) {
-            out.append(line.substr(0, first_non_ws));
-            out.append("//");
-            out.append(line.substr(first_non_ws));
+            const auto directive = line.substr(first_non_ws);
+            const bool lighting_v1 =
+                directive.size() >= 19
+                && directive.substr(0, 19) == "#require LightingV1"
+                && (directive.size() == 19
+                    || std::isspace(static_cast<unsigned char>(directive[19]))
+                    || directive[19] == '\r');
+            if (lighting_v1) {
+                out.append(line.substr(0, first_non_ws));
+                out.append("//");
+                out.append(directive);
+                if (! injected_lighting_v1) {
+                    out.push_back('\n');
+                    out.append(kLightingV1Stub);
+                    injected_lighting_v1 = true;
+                }
+            } else {
+                out.append(line.substr(0, first_non_ws));
+                out.append("//");
+                out.append(directive);
+            }
         } else {
             out.append(line);
         }
